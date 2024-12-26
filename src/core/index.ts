@@ -26,6 +26,11 @@ import {
 } from './utils/descriptorCache'
 import { parseVueRequest } from './utils/query'
 import type {
+  PluginLoadHookParam,
+  ResolvedUserConfig,
+  Server,
+} from '@farmfe/core'
+import type {
   SFCBlock,
   SFCScriptCompileOptions,
   SFCStyleCompileOptions,
@@ -142,14 +147,14 @@ export interface Options {
      * - **default:** `'filepath'` in development, `'filepath-source'` in production
      */
     componentIdGenerator?:
-      | 'filepath'
-      | 'filepath-source'
-      | ((
-          filepath: string,
-          source: string,
-          isProduction: boolean | undefined,
-          getHash: (text: string) => string,
-        ) => string)
+    | 'filepath'
+    | 'filepath-source'
+    | ((
+      filepath: string,
+      source: string,
+      isProduction: boolean | undefined,
+      getHash: (text: string) => string,
+    ) => string)
   }
 }
 
@@ -237,13 +242,13 @@ export const plugin = createUnplugin<Options | undefined, false>(
 
       vite: {
         api,
-        handleHotUpdate(ctx) {
+        async handleHotUpdate(ctx) {
+          // console.log(ctx);
           ctx.server.ws.send({
             type: 'custom',
             event: 'file-changed',
             data: { file: normalizePath(ctx.file) },
           })
-
           if (options.value.compiler.invalidateTypeCache) {
             options.value.compiler.invalidateTypeCache(ctx.file)
           }
@@ -321,6 +326,85 @@ export const plugin = createUnplugin<Options | undefined, false>(
         },
       },
 
+      farm: {
+        config(config: ResolvedUserConfig) {
+          return {
+            compilation: {
+              resolve: {
+                dedupe:
+                  config.compilation.output.targetEnv === 'node' ? [] : ['vue'],
+              },
+              define: {
+                __VUE_OPTIONS_API__: !!(
+                  (options.value.features?.optionsAPI ?? true) ||
+                  config.define?.__VUE_OPTIONS_API__
+                ),
+                __VUE_PROD_DEVTOOLS__: !!(
+                  options.value.features?.prodDevtools ||
+                  config.define?.__VUE_PROD_DEVTOOLS__
+                ),
+                __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: !!(
+                  options.value.features?.prodHydrationMismatchDetails ||
+                  config.define?.__VUE_PROD_HYDRATION_MISMATCH_DETAILS__
+                ),
+              },
+            },
+          }
+        },
+
+        configResolved(config) {
+          options.value = {
+            ...options.value,
+            root: config.root,
+            sourceMap: config.compilation?.sourcemap,
+            cssDevSourcemap: config.compilation?.sourcemap,
+            isProduction: config.compilation?.mode === 'production',
+            compiler: options.value.compiler || resolveCompiler(config.root),
+            devToolsEnabled: !!(
+              options.value.features.prodDevtools ||
+              config.compilation.define!.__VUE_PROD_DEVTOOLS__ ||
+              config.compilation?.mode !== 'production'
+            ),
+          }
+        },
+
+        configureServer(server: Server) {
+          const {
+            config: {
+              compilation: {
+                output: { publicPath },
+              },
+            },
+          } = server
+          options.value.devServer = Object.assign(server, {
+            config: { ...server.config, base: publicPath },
+          })
+        },
+
+        updateModules: {
+          executor(ctx) {
+            options.value.devServer.ws.send({
+              type: 'custom',
+              event: 'file-changed',
+              data: { file: normalizePath(ctx.file) },
+            })
+            if (options.value.compiler.invalidateTypeCache) {
+              options.value.compiler.invalidateTypeCache(ctx.file)
+            }
+            if (typeDepToSFCMap.has(ctx.file)) {
+              return handleTypeDepChange(typeDepToSFCMap.get(ctx.file)!, ctx)
+            }
+            if (filter.value(ctx.file)) {
+              return handleHotUpdate(
+                ctx,
+                options.value,
+                customElementFilter.value(ctx.file),
+              )
+            }
+          },
+        },
+      },
+
       buildStart() {
         const compiler = (options.value.compiler =
           options.value.compiler || resolveCompiler(options.value.root))
@@ -357,6 +441,7 @@ export const plugin = createUnplugin<Options | undefined, false>(
         }
 
         const { filename, query } = parseVueRequest(id)
+
         // select corresponding block for sub-part virtual modules
         if (query.vue) {
           if (query.src) {
@@ -416,7 +501,7 @@ export const plugin = createUnplugin<Options | undefined, false>(
           // sub block request
           const descriptor = query.src
             ? getSrcDescriptor(filename, query) ||
-              getTempSrcDescriptor(filename, query)
+            getTempSrcDescriptor(filename, query)
             : getDescriptor(filename, options.value)!
 
           if (query.type === 'template') {
